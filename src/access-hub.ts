@@ -140,6 +140,7 @@ export class AccessHub extends AccessDevice {
   private mainDoorLocationId: string | undefined;
   private sideDoorLocationId: string | undefined;
   private sideDoorGateTransitionUntil: number;
+  private useDoorLockRule: boolean;
   public uda: AccessDeviceConfig;
 
   // Create an instance.
@@ -157,6 +158,7 @@ export class AccessHub extends AccessDevice {
     this.mainDoorLocationId = undefined;
     this.sideDoorLocationId = undefined;
     this.sideDoorGateTransitionUntil = 0;
+    this.useDoorLockRule = (this.uda.device_type !== "UGT") && this.hasFeature("Hub.Door.UseLockRule");
     this.doorbellRingRequestId = null;
 
     // If we attempt to set the delay interval to something invalid, then assume we are using the default unlock behavior.
@@ -362,7 +364,10 @@ export class AccessHub extends AccessDevice {
     this.accessory.context.mac = this.uda.mac;
     this.accessory.context.controller = this.controller.uda.host.mac;
 
-    if(this.lockDelayInterval === undefined) {
+    if(this.useDoorLockRule) {
+
+      this.log.info("The door lock relay will remain unlocked until locked in HomeKit.");
+    } else if(this.lockDelayInterval === undefined) {
 
       this.log.info("The door lock relay will lock five seconds after unlocking in HomeKit.");
     } else {
@@ -1175,7 +1180,7 @@ export class AccessHub extends AccessDevice {
 
     // Only allow relocking if we are able to do so. UA Gate is exempt since it's a motorized gate that needs to close. For non-UA Gate hubs, the same restriction
     // applies to both Lock and GarageDoorOpener service types since GarageDoorOpener is just a visual convenience for the same underlying lock behavior.
-    if((this.lockDelayInterval === undefined) && isLocking && (this.uda.device_type !== "UGT")) {
+    if((this.lockDelayInterval === undefined) && !this.useDoorLockRule && isLocking && (this.uda.device_type !== "UGT")) {
 
       this.log.error("Unable to manually relock the %s when the lock relay is configured to the default settings.", doorName);
 
@@ -1243,6 +1248,37 @@ export class AccessHub extends AccessDevice {
 
           setTimeout(() => this.hkLockState = this.hap.Characteristic.LockCurrentState.SECURED, AUTO_LOCK_DELAY_MS);
         }
+      }
+
+      return true;
+    }
+
+    // Use a door lock rule when explicitly configured. Recent Access firmware requires the hub ID in the path and the door location ID in the query string.
+    if(this.useDoorLockRule) {
+
+      const doorLocationId = this.uda.door?.unique_id ??
+        this.uda.extensions?.find(ext => ext.extension_name === "port_setting")?.target_value ?? this.uda.location_id;
+
+      if(!doorLocationId) {
+
+        this.log.error("Unable to %s the door. Door location not found.", action);
+
+        return false;
+      }
+
+      const params = new URLSearchParams({ get_result: "true", location_id: doorLocationId });
+      const endpoint = this.controller.udaApi.getApiEndpoint("device") + "/" + this.uda.unique_id + "/lock_rule?" + params.toString();
+      const response = await this.controller.udaApi.retrieve(endpoint, {
+
+        body: JSON.stringify({ type: isLocking ? "reset" : "keep_unlock" }),
+        method: "PUT"
+      });
+
+      if(!this.controller.udaApi.responseOk(response?.statusCode)) {
+
+        this.log.error("Unable to %s the door.", action);
+
+        return false;
       }
 
       return true;
