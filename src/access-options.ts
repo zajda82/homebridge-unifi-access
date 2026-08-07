@@ -2,7 +2,7 @@
  *
  * access-options.ts: Feature option and type definitions for UniFi Access.
  */
-import { ACCESS_DEVICE_REMOVAL_DELAY_INTERVAL, ACCESS_DEVICE_UNLOCK_INTERVAL } from "./settings.js";
+import { ACCESS_DEVICE_REMOVAL_DELAY_INTERVAL, ACCESS_DEVICE_UNLOCK_INTERVAL, ACCESS_GATE_TRANSITION_TIMEOUT } from "./settings.js";
 import type { FeatureOptionEntry } from "homebridge-plugin-utils";
 
 // Plugin configuration options.
@@ -80,6 +80,7 @@ export const featureOptions: { [index: string]: AccessFeatureOption[] } = {
     { default: false, description: "Use a lock accessory instead of a garage door opener accessory for the gate.", modelKey: ["UA Gate"], name: "Door.UseLock" },
     { default: false, description: "Use a garage door opener accessory instead of a lock accessory. This is a visual preference only within HomeKit; the underlying lock behavior and feature options remain the same.", modelKey: [ "UA Ultra", "UA Hub", "UA Hub Door Mini" ], name: "Door.UseGarageOpener" },
     { default: false, description: "Control the door using UniFi Access lock rules. Unlocking applies a keep-unlocked rule and locking resets the rule. This overrides the lock delay interval.", name: "Door.UseLockRule" },
+    { default: false, defaultValue: ACCESS_GATE_TRANSITION_TIMEOUT, description: "Timeout, in seconds, to wait for the gate to finish opening or closing before accepting the current position sensor state. While the gate is moving, stale or bouncing position sensor readings are ignored to prevent spurious open and closed notifications in HomeKit. By default, the timeout is 90 seconds.", modelKey: ["UA Gate"], name: "GateTransitionTimeout" },
     { default: false, defaultValue: ACCESS_DEVICE_UNLOCK_INTERVAL, description: "Delay, in minutes, before locking the door lock relay once it's been unlocked by HomeKit. If set to 0, it will remain unlocked indefinitely. This applies regardless of whether you use a lock or garage door opener accessory. By default, the door lock relay will lock five seconds after unlocking.", name: "LockDelayInterval" },
     { default: false, description: "Add a switch accessory to control the door lock relay. This can be useful in automation scenarios where you want to work around HomeKit's security restrictions and trigger events when a lock or unlock event occurs. This works with both lock and garage door opener accessories.", name: "Lock.Trigger" },
     { default: true, description: "Add a doorbell accessory to handle doorbell ring events in HomeKit.", hasCapability: ["door_bell"], name: "Doorbell" },

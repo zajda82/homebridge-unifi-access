@@ -20,6 +20,9 @@ export const ACCESS_DEVICE_REMOVAL_DELAY_INTERVAL = 60;
 // Default delay, in minutes, before locking an unlocked door relay.
 export const ACCESS_DEVICE_UNLOCK_INTERVAL = 0;
 
+// Default timeout, in seconds, to wait for a motorized gate to finish opening or closing before accepting the current position sensor state.
+export const ACCESS_GATE_TRANSITION_TIMEOUT = 90;
+
 // Default duration, in seconds, of motion events. Setting this too low will potentially cause a lot of notification spam.
 export const ACCESS_MOTION_DURATION = 10;
 

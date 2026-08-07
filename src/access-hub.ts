@@ -6,6 +6,7 @@ import { AccessDevice, type AccessHints } from "./access-device.js";
 import type { AccessDeviceConfig, AccessEventDoorbellCancel, AccessEventDoorbellRing, AccessEventPacket } from "unifi-access";
 import type { CharacteristicValue, PlatformAccessory } from "homebridge";
 import { acquireService, validService } from "homebridge-plugin-utils";
+import { ACCESS_GATE_TRANSITION_TIMEOUT } from "./settings.js";
 import type { AccessController } from "./access-controller.js";
 import { AccessReservedNames } from "./access-types.js";
 
@@ -126,7 +127,6 @@ type DoorServiceType = "Lock" | "GarageDoorOpener";
 
 // Constants for timing.
 const AUTO_LOCK_DELAY_MS = 5000;
-const GATE_TRANSITION_COOLDOWN_MS = 5000;
 
 export class AccessHub extends AccessDevice {
 
@@ -135,11 +135,14 @@ export class AccessHub extends AccessDevice {
   private _hkSideDoorDpsState: CharacteristicValue;
   private _hkSideDoorLockState: CharacteristicValue;
   private doorbellRingRequestId: string | null;
-  private gateTransitionUntil: number;
+  private gateTransitionTarget: CharacteristicValue | null;
+  private gateTransitionTimeoutMs: number;
+  private gateTransitionTimer: NodeJS.Timeout | null;
   private lockDelayInterval: number | undefined;
   private mainDoorLocationId: string | undefined;
   private sideDoorLocationId: string | undefined;
-  private sideDoorGateTransitionUntil: number;
+  private sideDoorGateTransitionTarget: CharacteristicValue | null;
+  private sideDoorGateTransitionTimer: NodeJS.Timeout | null;
   private useDoorLockRule: boolean;
   public uda: AccessDeviceConfig;
 
@@ -153,13 +156,21 @@ export class AccessHub extends AccessDevice {
     this._hkLockState = this.hubLockState;
     this._hkSideDoorDpsState = this.hubSideDoorDpsState;
     this._hkSideDoorLockState = this.hubSideDoorLockState;
-    this.gateTransitionUntil = 0;
+    this.gateTransitionTarget = null;
+    this.gateTransitionTimer = null;
     this.lockDelayInterval = this.getFeatureNumber("Hub.LockDelayInterval") ?? undefined;
     this.mainDoorLocationId = undefined;
     this.sideDoorLocationId = undefined;
-    this.sideDoorGateTransitionUntil = 0;
+    this.sideDoorGateTransitionTarget = null;
+    this.sideDoorGateTransitionTimer = null;
     this.useDoorLockRule = (this.uda.device_type !== "UGT") && this.hasFeature("Hub.Door.UseLockRule");
     this.doorbellRingRequestId = null;
+
+    // Determine how long we wait for the gate to finish moving before accepting the current position sensor state. If we've been given an invalid value, we use our
+    // default.
+    const transitionTimeout = this.getFeatureNumber("Hub.GateTransitionTimeout") ?? ACCESS_GATE_TRANSITION_TIMEOUT;
+
+    this.gateTransitionTimeoutMs = ((transitionTimeout > 0) ? transitionTimeout : ACCESS_GATE_TRANSITION_TIMEOUT) * 1000;
 
     // If we attempt to set the delay interval to something invalid, then assume we are using the default unlock behavior.
     if((this.lockDelayInterval !== undefined) && (this.lockDelayInterval < 0)) {
@@ -754,6 +765,15 @@ export class AccessHub extends AccessDevice {
 
       if(isUaGate) {
 
+        // If a transition is in flight, report the transitional state rather than a stale position sensor reading.
+        const transitionTarget = isSideDoor ? this.sideDoorGateTransitionTarget : this.gateTransitionTarget;
+
+        if(transitionTarget !== null) {
+
+          return transitionTarget === this.hap.Characteristic.CurrentDoorState.CLOSED ? this.hap.Characteristic.CurrentDoorState.CLOSING :
+            this.hap.Characteristic.CurrentDoorState.OPENING;
+        }
+
         const dpsState = isSideDoor ? this._hkSideDoorDpsState : this.hkDpsState;
 
         return dpsState === this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED ? this.hap.Characteristic.CurrentDoorState.CLOSED :
@@ -775,19 +795,15 @@ export class AccessHub extends AccessDevice {
       // UA Gate uses the location unlock endpoint to control the motorized gate. Non-UA Gate hubs use explicit lock/unlock commands.
       if(isUaGate) {
 
-        // Set a transition cooldown to prevent WebSocket events from immediately reverting the door state. This gives the gate time to physically move before we accept
-        // DPS updates.
-        if(isSideDoor) {
+        // Track the transition so we show Opening/Closing in HomeKit and ignore stale or bouncing position sensor readings until the gate finishes physically moving.
+        // If the gate is already in the requested position, we skip the transition and just retrigger the command.
+        const dpsState = isSideDoor ? this._hkSideDoorDpsState : this.hkDpsState;
+        const alreadyThere = shouldClose === (dpsState === this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED);
 
-          this.sideDoorGateTransitionUntil = Date.now() + GATE_TRANSITION_COOLDOWN_MS;
-        } else {
+        if(!alreadyThere) {
 
-          this.gateTransitionUntil = Date.now() + GATE_TRANSITION_COOLDOWN_MS;
+          this.beginGateTransition(isSideDoor, shouldClose);
         }
-
-        // Immediately show transitional state (Opening/Closing) while the door moves.
-        service.updateCharacteristic(this.hap.Characteristic.CurrentDoorState, shouldClose ? this.hap.Characteristic.CurrentDoorState.CLOSING :
-          this.hap.Characteristic.CurrentDoorState.OPENING);
 
         // Trigger the gate in the requested direction.
         const triggerGate = isSideDoor ? async (): Promise<boolean> => this.hubSideDoorLockCommand(shouldClose) :
@@ -795,14 +811,8 @@ export class AccessHub extends AccessDevice {
 
         if(!(await triggerGate())) {
 
-          // Clear the transition cooldown on failure.
-          if(isSideDoor) {
-
-            this.sideDoorGateTransitionUntil = 0;
-          } else {
-
-            this.gateTransitionUntil = 0;
-          }
+          // Abandon the transition on failure.
+          this.cancelGateTransition(isSideDoor);
 
           // Revert target state on failure.
           setTimeout(() => {
@@ -813,7 +823,7 @@ export class AccessHub extends AccessDevice {
           }, 50);
         }
 
-        // The DPS sensor event will update the CurrentDoorState when the gate finishes moving.
+        // The DPS sensor event will update the CurrentDoorState when the gate finishes moving, or the transition timeout will apply the current sensor state.
         return;
       }
 
@@ -1363,15 +1373,75 @@ export class AccessHub extends AccessDevice {
     }
   }
 
+  // Begin tracking a gate transition toward the requested position. We show the transitional state (Opening/Closing) in HomeKit and ignore position sensor updates
+  // that don't match our destination until the gate finishes moving or the transition times out.
+  private beginGateTransition(isSideDoor: boolean, shouldClose: boolean): void {
+
+    // Clear any transition already in flight.
+    this.cancelGateTransition(isSideDoor);
+
+    const target = shouldClose ? this.hap.Characteristic.CurrentDoorState.CLOSED : this.hap.Characteristic.CurrentDoorState.OPEN;
+
+    // If the position sensor never confirms the requested state, accept whatever state the sensor reports once we timeout so we don't get stuck in a transitional state.
+    const timer = setTimeout(() => {
+
+      this.log.debug("Gate transition timed out waiting for the position sensor to confirm the %s state. Applying the current sensor state.",
+        shouldClose ? "closed" : "open");
+
+      this.cancelGateTransition(isSideDoor);
+      this.updateDoorServiceState(isSideDoor);
+    }, this.gateTransitionTimeoutMs);
+
+    if(isSideDoor) {
+
+      this.sideDoorGateTransitionTarget = target;
+      this.sideDoorGateTransitionTimer = timer;
+    } else {
+
+      this.gateTransitionTarget = target;
+      this.gateTransitionTimer = timer;
+    }
+
+    // Show the transitional state in HomeKit while the gate physically moves. We also sync the target state so externally-initiated movements (e.g. a remote or the
+    // Access app) present the correct direction in HomeKit.
+    const service = this.accessory.getService(this.hap.Service.GarageDoorOpener);
+
+    service?.updateCharacteristic(this.hap.Characteristic.TargetDoorState,
+      shouldClose ? this.hap.Characteristic.TargetDoorState.CLOSED : this.hap.Characteristic.TargetDoorState.OPEN);
+    service?.updateCharacteristic(this.hap.Characteristic.CurrentDoorState,
+      shouldClose ? this.hap.Characteristic.CurrentDoorState.CLOSING : this.hap.Characteristic.CurrentDoorState.OPENING);
+  }
+
+  // Stop tracking a gate transition without applying any state.
+  private cancelGateTransition(isSideDoor: boolean): void {
+
+    if(isSideDoor) {
+
+      if(this.sideDoorGateTransitionTimer) {
+
+        clearTimeout(this.sideDoorGateTransitionTimer);
+        this.sideDoorGateTransitionTimer = null;
+      }
+
+      this.sideDoorGateTransitionTarget = null;
+    } else {
+
+      if(this.gateTransitionTimer) {
+
+        clearTimeout(this.gateTransitionTimer);
+        this.gateTransitionTimer = null;
+      }
+
+      this.gateTransitionTarget = null;
+    }
+  }
+
   // Update door service state based on configured service type.
   private updateDoorServiceState(isSideDoor: boolean): void {
 
     const serviceType = isSideDoor ? "Lock" : this.doorServiceType;
     const lockState = isSideDoor ? this.hkSideDoorLockState : this.hkLockState;
     const triggerSubtype = isSideDoor ? AccessReservedNames.SWITCH_LOCK_DOOR_SIDE_TRIGGER : AccessReservedNames.SWITCH_LOCK_TRIGGER;
-
-    // Check if we're in a transition cooldown period - skip updates to preserve the Opening/Closing state.
-    const transitionUntil = isSideDoor ? this.sideDoorGateTransitionUntil : this.gateTransitionUntil;
 
     if(serviceType === "GarageDoorOpener") {
 
@@ -1390,11 +1460,19 @@ export class AccessHub extends AccessDevice {
           const targetState = dpsState === this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED ?
             this.hap.Characteristic.TargetDoorState.CLOSED : this.hap.Characteristic.TargetDoorState.OPEN;
 
-          // If in transition cooldown, ignore all DPS updates to let the gate stabilize. The gate sensor often bounces between open/closed during movement. We'll accept
-          // the final state once the cooldown expires.
-          if(Date.now() < transitionUntil) {
+          // If a transition is in flight, we only accept the position sensor state once it matches the requested target. The gate sensor can bounce or report stale
+          // readings while the gate is physically moving, so anything that isn't our destination state gets ignored until the transition completes or times out.
+          const transitionTarget = isSideDoor ? this.sideDoorGateTransitionTarget : this.gateTransitionTarget;
 
-            return;
+          if(transitionTarget !== null) {
+
+            if(doorState !== transitionTarget) {
+
+              return;
+            }
+
+            // The gate has finished moving - complete the transition and fall through to apply the final state.
+            this.cancelGateTransition(isSideDoor);
           }
 
           service.updateCharacteristic(this.hap.Characteristic.TargetDoorState, targetState);
@@ -1695,6 +1773,15 @@ export class AccessHub extends AccessDevice {
     return Array.isArray(capability) ? capability.some(c => this.uda.capabilities.includes(c)) : this.uda.capabilities.includes(capability as string);
   }
 
+  // Cleanup our device, clearing any in-flight gate transition timers.
+  public cleanup(): void {
+
+    this.cancelGateTransition(false);
+    this.cancelGateTransition(true);
+
+    super.cleanup();
+  }
+
   // Update door state from location data (lock and DPS).
   private updateDoorFromLocationState(
     doorState: { lock: "locked" | "unlocked"; dps: "open" | "close" },
@@ -1783,6 +1870,14 @@ export class AccessHub extends AccessDevice {
 
       const doorName = isSideDoor ? "Side door" : "Gate";
       const mqttTopic = isSideDoor ? "sidedoor/lock" : "lock";
+
+      // If the main gate is presented as a garage door opener and it's currently closed, an unlock means the gate is about to start opening. Track the transition so
+      // HomeKit shows Opening and we filter sensor bounce until the gate finishes moving.
+      if(isMainDoor && (this.doorServiceType === "GarageDoorOpener") && (this.gateTransitionTarget === null) &&
+        (this.hkDpsState === this.hap.Characteristic.ContactSensorState.CONTACT_DETECTED)) {
+
+        this.beginGateTransition(false, false);
+      }
 
       // Set unlocked state.
       if(isSideDoor) {
